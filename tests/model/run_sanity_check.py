@@ -6,8 +6,8 @@
 import sys
 import unittest
 
-sys.path.append('../DeepSpeedExamples/Megatron_GPT2')
-sys.path.append('../DeepSpeedExamples/BingBertSquad')
+sys.path.append('../DeepSpeedExamples_copied/Megatron_GPT2')
+sys.path.append('../DeepSpeedExamples_copied/BingBertSquad')
 
 import os
 

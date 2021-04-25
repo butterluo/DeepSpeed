@@ -685,7 +685,7 @@ class FP16_DeepSpeedZeroOptimizer(object):
                 return
 
             # Accumulate destination ranks and bucket offsets for each gradient slice.
-            # Note: potential future optimization, record access pattern of parameters
+            # Note: potential future optimization, record access pattern of parameters #btbt ??? 'access pattern of parameters' 具体指什么?怎么record>
             # in backward pass and partition gradients w.r.t. access pattern so that our
             # bucket is guaranteed to be contiguous w.r.t. ranks
             rank_and_offsets = []
