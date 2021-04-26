@@ -221,7 +221,7 @@ class FP16_DeepSpeedZeroOptimizer(object):
             # Record padding required to align group to world size
             if partition_id == dist.get_world_size(group=self.dp_process_group) - 1:
                 padding = get_alignment_padding(self.fp16_groups[i],
-                                                self.partition_count)
+                                                self.partition_count)#btbt 如果是最后一个partition,有可能出现数据不足以填满以partition_count(也就是world_size)划分的parition size,所以为了补足到parition size则要padding若干个数据,使得每个partition的size一致以方便后续的分布式计算
             else:
                 padding = 0
             self.groups_padding.append(padding)
@@ -235,7 +235,7 @@ class FP16_DeepSpeedZeroOptimizer(object):
             see_memory_usage(f"After moving param group {i} to CPU")
 
             #create flat buffer in CPU and move to GPU
-            self.fp16_groups_flat.append(
+            self.fp16_groups_flat.append(#btbt fp16_groups_flat保存的是flatten过的param,若数据无法平分成world size块, 则会在最后那块进行padding. 这是为了optimizer使用的param能保存在一块连续内存中
                 flatten_dense_tensors_aligned(
                     self.fp16_groups[i],
                     dist.get_world_size(group=self.dp_process_group)).cuda(
@@ -247,7 +247,7 @@ class FP16_DeepSpeedZeroOptimizer(object):
                     f"After Flattening and after emptying param group {i} cache")
 
             # set model fp16 weight to slices of flattened buffer
-            updated_params = _unflatten_dense_tensors(self.fp16_groups_flat[i],
+            updated_params = _unflatten_dense_tensors(self.fp16_groups_flat[i],#btbt 这里_unflatten_dense_tensors其实是把连续内存fp16_groups_flat中的param映射成fp16_groups中param的正常shape的view,并赋给param.data,使得param.data里的数据其实就是连续内存的view,共享连续内存fp16_groups_flat
                                                       self.fp16_groups[i])
             for p, q in zip(self.fp16_groups[i], updated_params):
                 p.data = q.data
@@ -255,18 +255,18 @@ class FP16_DeepSpeedZeroOptimizer(object):
             #divide the flat weights into near equal partition equal to the data parallel degree
             #each process will compute on a different part of the partition
             data_parallel_partitions = self.get_data_parallel_partitions(
-                self.fp16_groups_flat[i])
+                self.fp16_groups_flat[i]) #btbt 连续内存fp16_groups_flat基于world size划分成不同partition的view并赋给parallel_partitioned_fp16_groups,两者共享一块连续内存. 但存在一个tensor的一部分在一个partition,另一部分在另一个partition的情况,所以partition view的起止点和tensor的起止点不一定一致
             self.parallel_partitioned_fp16_groups.append(data_parallel_partitions)
 
             # a partition of the fp32 master weights that will be updated by this process
-            self.single_partition_of_fp32_groups.append(
+            self.single_partition_of_fp32_groups.append(#btbt 当前group的param中属于当前进程所负责的partition的那部分以fp32形式保存在single_partition_of_fp32_groups中,并且不共享fp16_groups_flat连续内存,而是另一个内存副本
                 self.parallel_partitioned_fp16_groups[i][partition_id].to(
                     self.device).clone().float().detach())
 
             # modify optimizer of have flat master weight
             self.single_partition_of_fp32_groups[
                 i].requires_grad = True  # keep this in case internal optimizer uses it
-            param_group['params'] = [self.single_partition_of_fp32_groups[i]]
+            param_group['params'] = [self.single_partition_of_fp32_groups[i]]#btbt param_group['params']是供原生optimizer进行grad计算与update用的param,这里的意思是该进程的原生optimizer只负责基于所负责的partition的param进行计算grad并仅update所负责的partition param
 
             partition_size = len(self.fp16_groups_flat[i]) / dist.get_world_size(
                 group=self.dp_process_group)
@@ -275,7 +275,7 @@ class FP16_DeepSpeedZeroOptimizer(object):
             self.partition_size.append(partition_size)
             self.params_in_partition.append(params_in_partition)
             self.params_not_in_partition.append(params_not_in_partition)
-            self.first_offset.append(first_offset)
+            self.first_offset.append(first_offset)#btbt 由于会出现某个param.data(也就是tensor)中的一部分在上一个partition,另一部分在这个parition的情况,所以first_offset是用来保存在该partition中的tensor的起点位置的
 
         self.reduce_bucket_size = int(reduce_bucket_size)
         self.allgather_bucket_size = int(allgather_bucket_size)
@@ -466,8 +466,11 @@ class FP16_DeepSpeedZeroOptimizer(object):
                         partition_id)
 
     def independent_gradient_partition_epilogue(self):
+        """
+        btbt 在backward完后调用,处理剩余的数据并累计本进程所负责的grad,同时清空ipg_buffer
+        """
         self.report_ipg_memory_usage(f"In ipg_epilogue before reduce_ipg_grads", 0)
-        self.reduce_ipg_grads()
+        self.reduce_ipg_grads() #btbt 把ipg_buffer中剩余的数据发给相应的负责进程
         self.report_ipg_memory_usage(f"In ipg_epilogue after reduce_ipg_grads", 0)
 
         #if dist.get_rank() == 0:
@@ -480,7 +483,7 @@ class FP16_DeepSpeedZeroOptimizer(object):
 
         if self.cpu_offload is False:
             for i, _ in enumerate(self.fp16_groups):
-
+                #btbt 这里累计该进程所负责的partition的grad(用flat的方式保存),每次backward都累计到averaged_gradients里,供step()方式用来计算Adam的各种状态,也是communicates grad的需要
                 if not i in self.averaged_gradients or self.averaged_gradients[i] is None:
                     self.averaged_gradients[i] = self.get_flat_partition(
                         self.params_in_partition[i],
@@ -498,9 +501,9 @@ class FP16_DeepSpeedZeroOptimizer(object):
                                                       return_tensor_list=True)
 
                     for accumulated_grad, new_avg_grad in zip(self.averaged_gradients[i],avg_new):
-                        accumulated_grad.add_(new_avg_grad)
+                        accumulated_grad.add_(new_avg_grad)#btbt 由于在reduce_ipg_grads()->average_tensor()中已经做了平均,所以这里直接相加,这种相加是跨每次迭代的backward的
 
-        self._release_ipg_buffers()
+        self._release_ipg_buffers()#btbt 清空ipg_buffer
 
         # No need to keep the gradients anymore.
         # All gradients required by the step
@@ -589,9 +592,9 @@ class FP16_DeepSpeedZeroOptimizer(object):
                     def wrapper(param, i):
                         param_tmp = param.expand_as(param)
                         grad_acc = param_tmp.grad_fn.next_functions[0][0]
-
+                        #btbt 当某param的grad计算完后会调用该hook,
                         def reduce_partition_and_remove_grads(*notneeded):
-                            self.reduce_ready_partitions_and_remove_grads(param, i)
+                            self.reduce_ready_partitions_and_remove_grads(param, i)#btbt 这里其实直接调reduce_independent_p_g_buckets_and_remove_grads
 
                         grad_acc.register_hook(reduce_partition_and_remove_grads)
                         self.grad_accs.append(grad_acc)
@@ -611,7 +614,11 @@ class FP16_DeepSpeedZeroOptimizer(object):
 
     ############### Independent Partition Gradient ########################
     def reduce_independent_p_g_buckets_and_remove_grads(self, param, i):
+        """
+        btbt 把param信息保存到连续内存ipg_buffer中,当满的时候就把相关grad信息发到相应的进程,然后清空ipg_buffer继续保存后续的param
+        """
         if self.elements_in_ipg_bucket + param.numel() > self.reduce_bucket_size:
+            #btbt elements_in_ipg_bucket可看作ipg_buffer的存储下标指针,这里意思是若加上这次的param个数,就会超出ipg_buffer的容量,该情况下会调用reduce_ipg_grads()把ipg_buffer的数据发送到负责它的相应节点,然后把elements_in_ipg_bucket指向ipg_buffer的开始位置,相当于清空ipg_buffer重新缓存param.grad
             self.report_ipg_memory_usage("In ipg_remove_grads before reduce_ipg_grads",
                                          param.numel())
             self.reduce_ipg_grads()
@@ -627,9 +634,9 @@ class FP16_DeepSpeedZeroOptimizer(object):
             f"The parameter {param_id} has already been reduced. \
             Gradient computed twice for this partition. \
             Multiple gradient reduction is currently not supported"
-
+        #btbt 把这次param.grad保存到ipg_buffer中,并设置相应的存储下标指针,保存相关grads_in_ipg_bucket和params_in_ipg_bucket供后续同步ipg_buffer的信息到相应节点时使用
         #keeping the gradients contiguous to prevent memory fragmentation, and avoid flattening
-        if self.contiguous_gradients:
+        if self.contiguous_gradients: #btbt 该代码块负责把param.grad中的数据变成contiguous之后再塞回params.grad.data
             new_grad_tensor = self.ipg_buffer[self.ipg_index].narrow(
                 0,
                 self.elements_in_ipg_bucket,
@@ -673,6 +680,9 @@ class FP16_DeepSpeedZeroOptimizer(object):
         return tensor
 
     def average_tensor(self, tensor):
+        """
+        btbt 把params_in_ipg_bucket中的tensor平均后reduce(sum)到负责该部分param的进程,reduce后tensor中该进程负责的param部分会是sum后的结果,不是该进程负责的param部分仅是平均后的结果
+        """
         if self.overlap_comm:
             torch.cuda.synchronize()
             stream = self.reduction_stream
@@ -902,6 +912,10 @@ class FP16_DeepSpeedZeroOptimizer(object):
     ############################################################################################
 
     def copy_grads_in_partition(self, param):
+        """
+        btbt 要先判断param是否在本进程负责的partition内,若是则把它的grad复制到连续的grads_in_partition中,同时使param.grad连续化
+
+        """
         if self.cpu_offload:
 
             if self.gradient_accumulation_steps > 1:
@@ -924,6 +938,7 @@ class FP16_DeepSpeedZeroOptimizer(object):
                     total_size += param_in_partition.numel()
 
             see_memory_usage(f"before copying {total_size} gradients into partition")
+            #btbt grads_in_partition是保存当前进程负责的param的grad的连续内存块
             self.grads_in_partition = torch.empty(int(total_size),
                                                   dtype=torch.half,
                                                   device=torch.cuda.current_device())
@@ -940,13 +955,16 @@ class FP16_DeepSpeedZeroOptimizer(object):
         self.grads_in_partition_offset += param.numel()
 
     def reduce_ipg_grads(self):
+        """
+        btbt 把连续内存ipg_buffer中的grad信息发给相应负责的进程,若是本进程则同时同步到连续内存grads_in_partition中,否则param.grad=None. 然后清空ipg_buffer做下一轮的保存与同步
+        """
         if self.overlap_comm:
             stream = self.reduction_stream
         else:
             stream = torch.cuda.current_stream()
 
         if self.contiguous_gradients:
-            self.average_tensor(self.ipg_buffer[self.ipg_index])
+            self.average_tensor(self.ipg_buffer[self.ipg_index])#btbt 把ipg_buffer中的grad信息发到相应的负责进程
         else:
             self.buffered_reduce_fallback(
                 None,
@@ -973,8 +991,8 @@ class FP16_DeepSpeedZeroOptimizer(object):
                     else:
                         param.grad = None
                 elif self.contiguous_gradients:
-                    self.copy_grads_in_partition(param)
-
+                    self.copy_grads_in_partition(param)#btbt 如果发送给相应负责进程的grad信息所对应的负责进程就是本进程,也就是is_param_in_current_partition,那么会把grad保存到连续内存grads_in_partition中
+        #btbt 这里相当是清空ipg_buffer
         self.grads_in_ipg_bucket = []
         self.params_in_ipg_bucket = []
         self.elements_in_ipg_bucket = 0
@@ -1338,7 +1356,7 @@ class FP16_DeepSpeedZeroOptimizer(object):
         see_memory_usage(f"In step before checking overflow")
 
         # First compute norm for all group so we know if there is overflow
-        self.check_overflow()
+        self.check_overflow()#btbt 就是看下averaged_gradients中有没有nan或inf
 
         timers = self.timers
 
@@ -1381,7 +1399,7 @@ class FP16_DeepSpeedZeroOptimizer(object):
             else:
                 norm_groups.append(
                     self.get_grad_norm_direct(self.averaged_gradients[i],
-                                              self.params_in_partition[i]))
+                                              self.params_in_partition[i]))  #btbt 基于整个集群各个进程的param计算norm,所以不能直接用torch的norm,而是要调用all_reduce
 
                 #free gradients for all the prameters that are not updated by this process
                 self.free_grad_in_param_list(self.params_not_in_partition[i])
@@ -1400,9 +1418,9 @@ class FP16_DeepSpeedZeroOptimizer(object):
                 assert single_grad_partition.numel() == self.partition_size[i], \
                     "averaged gradients have different number of elements that partition size {} {} {} {}".format(single_grad_partition.numel(), self.partition_size[i], i, partition_id)
 
-                self.single_partition_of_fp32_groups[i].grad = single_grad_partition
+                self.single_partition_of_fp32_groups[i].grad = single_grad_partition#btbt 把当前partition对应的param.grad(保存在averaged_gradients中)进行flatten后,赋给single_partition_of_fp32_groups.grad供原生optimizer计算.因为在init中,原生optimizer的param_group['params']保存的就是single_partition_of_fp32_groups
                 #release all the gradient since we have already created a necessary copy in dp_grad_partition
-                self.free_grad_in_param_list(self.params_in_partition[i])
+                self.free_grad_in_param_list(self.params_in_partition[i])#btbt 在backward时计算出来的grad赋给single_partition_of_fp32_groups以供原生optimizer用后,params_in_partition和averaged_gradients就可以释放置空了,下次forward&backward再初始化
 
                 self.averaged_gradients[i] = None
 
@@ -1426,7 +1444,7 @@ class FP16_DeepSpeedZeroOptimizer(object):
                 for fp16_partitions, fp32_partition in zip(self.parallel_partitioned_fp16_groups, self.single_partition_of_fp32_groups):
                     fp16_partitions[partition_id].data.copy_(fp32_partition.data)
         else:
-            self.optimizer.step()
+            self.optimizer.step()#btbt 由于init中已经把本进程负责的partition param附给原生optimizer的param_group['params'],而在上一个for循环中又把所负责的partition param的grad赋给原生optimizer,所以简单地调用原生step就可以基于所负责的partition param grad计算optimizer所需要的grad并仅更新partition param
 
             #get rid of the fp32 gradients. Not needed anymore
             if not self.cpu_offload:
@@ -1434,7 +1452,7 @@ class FP16_DeepSpeedZeroOptimizer(object):
                     group.grad = None
 
             for fp16_partitions, fp32_partition in zip(self.parallel_partitioned_fp16_groups, self.single_partition_of_fp32_groups):
-                fp16_partitions[partition_id].data.copy_(fp32_partition.data)
+                fp16_partitions[partition_id].data.copy_(fp32_partition.data)#btbt 原生optimizer更新完它负责的partition param后,就把最新的parition param复制到parallel_partitioned_fp16_groups对应的partition部分,仅该部分是新更新的值,而其它部分依然保持上一次step的值
 
         timers('optimizer_step').stop()
 
@@ -1444,13 +1462,13 @@ class FP16_DeepSpeedZeroOptimizer(object):
         timers('optimizer_allgather').start()
         #gather the updated weights from everyone
         for group_id, partitioned_params in enumerate(self.parallel_partitioned_fp16_groups):
-
+            #btbt parallel_partitioned_fp16_groups此时仅该进程负责的那部分partition是最新param值,需要用all_gather把其它进程负责的partition param汇总过来,使得parallel_partitioned_fp16_groups中所有param都是最新值
             #Sequential AllGather Best of both worlds
             dp_world_size = dist.get_world_size(group=self.dp_process_group)
             num_shards = max(
                 1,
                 partitioned_params[partition_id].numel() * dp_world_size //
-                self.allgather_bucket_size)
+                self.allgather_bucket_size)#btbt all_gather是基于allgather_bucket_size做的,以免占用过大带宽和内存
 
             shard_size = partitioned_params[partition_id].numel() // num_shards
             num_elements = shard_size
@@ -1477,10 +1495,10 @@ class FP16_DeepSpeedZeroOptimizer(object):
         timers('optimizer_allgather').stop()
 
         # TODO: we probably don't need this? just to be safe
-        for i in range(len(norm_groups)):
+        for i in range(len(norm_groups)):#btbt 在init完成初始化的parallel_partitioned_fp16_groups是与fp16_groups_flat共享连续内存的,只是不同的view,所以fp16_groups_flat此时保持的也是最新的全量param
             updated_params = _unflatten_dense_tensors(self.fp16_groups_flat[i],
                                                       self.fp16_groups[i])
-            for p, q in zip(self.fp16_groups[i], updated_params):
+            for p, q in zip(self.fp16_groups[i], updated_params):#btbt 把连续内存fp16_groups_flat中的tensor变成param.data所需要的shape那样的view并赋给param.data,供forward/bcakward使用
                 p.data = q.data
 
         timers.log(

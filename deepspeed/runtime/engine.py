@@ -1062,7 +1062,7 @@ class DeepSpeedEngine(Module):
                  ranks=[0])
 
     def allreduce_bucket(self, bucket):
-        tensor = self.flatten(bucket)
+        tensor = self.flatten(bucket)#btbt flaten后更省资源和带宽
 
         tensor_to_allreduce = tensor
 
@@ -1094,6 +1094,9 @@ class DeepSpeedEngine(Module):
             buf.copy_(synced)
 
     def allreduce_no_retain(self, bucket, numel_per_bucket=500000000):
+        """
+        btbt 把bucket中所有tensor通过allreduce_bucket发送到各个进程
+        """
         small_bucket = []
         numel = 0
         for tensor in bucket:
@@ -1107,8 +1110,12 @@ class DeepSpeedEngine(Module):
             self.allreduce_and_copy(small_bucket)
 
     def buffered_allreduce_fallback(self, grads=None, elements_per_buffer=500000000):
+        """
+        btbt 非本进程负责的param.grad补zero后进行all_reduce,以达到每个进程负责的grad传到各个进程,使各个进程都有所有grad的效果
+        btbt ??? 用all_scatter会不会好点?省了补zero和sum的时间?还是这个时间也没多少,且方案难实现?
+        """
         grads = []
-        for param_name, param in self.module.named_parameters():
+        for param_name, param in self.module.named_parameters():#btbt 为了集群中做all_reduce,即使不是该进程负责的param.grad也补0,用于发给其负责进程做all_reduce(sum)
             if param.grad is None:
                 # In cases where there is an imbalance of empty grads across
                 # ranks we must create empty grads, this will ensure that every
@@ -1127,7 +1134,7 @@ class DeepSpeedEngine(Module):
                 else:
                     grads.append(grad_data)
 
-        split_buckets = split_half_float_double_csr(grads)
+        split_buckets = split_half_float_double_csr(grads)#btbt 把所有grad的数据分成half,float,double,csr四类供后续分别做all_reduce,可能不同的数据类型的策略不同,占的资源也不同
 
         for i, bucket_tuple in enumerate(split_buckets):
             bucket_type, bucket = bucket_tuple
