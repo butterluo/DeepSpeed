@@ -327,7 +327,7 @@ class FP16_DeepSpeedZeroOptimizer(object):
             self.accumulated_grads_in_cpu = {}
             self.norm_for_param_grads = {}
             self.local_overflow = False
-            self.grad_position = {}
+            self.grad_position = {}#btbt [cpu]get_grad_position()中可知,其格式为[group_id,param_start_offset,current_offset,num_elements],其中param_start_offset指本partition的param中属于本partition的tensor在param中的起点位置,current_offset指该tensor在params_in_partition(以及single_partition_of_fp32_groups)中的位置
             self.temp_grad_buffer_for_cpu_offload = torch.zeros(
                 largest_param_numel,
                 device=self.device).half().pin_memory()
@@ -782,7 +782,7 @@ class FP16_DeepSpeedZeroOptimizer(object):
         if param.grad is not None and self._has_inf_or_nan(param.grad.data):
             self.local_overflow = True
 
-    def async_accumulate_grad_in_cpu(self, param):
+    def async_accumulate_grad_in_cpu(self, param):#无调用
         param_id = self.get_param_id(param)
 
         #copy to a preexisiting buffer to avoid memory allocation penalty
@@ -800,7 +800,11 @@ class FP16_DeepSpeedZeroOptimizer(object):
 
         self.accumulated_grads_in_cpu[param_id].add_(dest_buffer)
 
-    def async_accumulate_grad_in_cpu_via_gpu(self, param):
+    def async_accumulate_grad_in_cpu_via_gpu(self, param):#输入本partition的param
+        """
+        btbt [cpu]accumulated_grads_in_cpu用于在cpu中累计grad,这里先把cpu在前step累计的grad转到gpu缓存dest_buffer中,然后再通过缓存dest_buffer把前step的grad累计到当前param.grad,累计后的param.grad再传给cpu的accumulated_grads_in_cpu
+        btbt ??? model.param在做forward&backward时难道不会自动累计grad? 还是create_reduce_and_remove_grad_hooks()中用hook把原有的accumulate功能覆盖了? accumulated_grads_in_cpu在step()后也没把累计grad复位为0,会导致grad在整个训练中累计并越来越大?
+        """
         param_id = self.get_param_id(param)
 
         #copy to a preexisiting buffer to avoid memory allocation penalty
@@ -818,14 +822,14 @@ class FP16_DeepSpeedZeroOptimizer(object):
         if self.micro_step_id > 0:
             dest_buffer.copy_(self.accumulated_grads_in_cpu[param_id].view(-1),
                               non_blocking=True)
-            param.grad.data.view(-1).add_(dest_buffer)
+            param.grad.data.view(-1).add_(dest_buffer)#btbt 在offload模式cpu上的accumulated_grads_in_cpu和gpu上的model.param.grad中都保持了一份grad
 
         #at the boundary we will send 32bit directly
         if not self.is_gradient_accumulation_boundary:
             self.accumulated_grads_in_cpu[param_id].data.copy_(param.grad.data.view(-1),
                                                                non_blocking=True)
 
-    def set_norm_for_param_grad(self, param):
+    def set_norm_for_param_grad(self, param):#无调用
         param_id = self.get_param_id(param)
         accumulated_grad = self.accumulated_grads_in_cpu[
             param_id] if self.gradient_accumulation_steps > 1 else param.grad
@@ -837,7 +841,10 @@ class FP16_DeepSpeedZeroOptimizer(object):
 
         self.norm_for_param_grads[param_id] = accumulated_grad.data.double().norm(2)
 
-    def set_norm_for_param_grad_in_gpu(self, param):
+    def set_norm_for_param_grad_in_gpu(self, param):#输入本partition的param
+        """
+        btbt [cpu]当累计grad的step达到时,获取该param中属于本partition的tensor,然后会计算最终累计grad的norm并保存在norm_for_param_grads中,由于使用的是model.param.grad,所以tensor是在gpu中
+        """
         param_id = self.get_param_id(param)
         accumulated_grad = param.grad
 
@@ -848,7 +855,7 @@ class FP16_DeepSpeedZeroOptimizer(object):
 
         self.norm_for_param_grads[param_id] = accumulated_grad.data.double().norm(2)
 
-    def async_inplace_copy_grad_to_fp32_buffer(self, param):
+    def async_inplace_copy_grad_to_fp32_buffer(self, param):#无调用
         param_id = self.get_param_id(param)
 
         [i, source_offset, dest_offset, num_elements] = self.grad_position[param_id]
@@ -868,7 +875,10 @@ class FP16_DeepSpeedZeroOptimizer(object):
                                                     num_elements).float()
         dest_tensor.copy_(src_tensor, non_blocking=True)
 
-    def async_inplace_copy_grad_to_fp32_buffer_from_gpu(self, param):
+    def async_inplace_copy_grad_to_fp32_buffer_from_gpu(self, param):#输入本partition的param
+        """
+        btbt [cpu]当累计grad的step达到时,把gpu上的通过backward计算出来的最终累计param.grad复制到cpu上的仅保存本partition的param的single_partition_of_fp32_groups.grad上,供cpu adam做optimizer.step()
+        """
         param_id = self.get_param_id(param)
 
         [i, source_offset, dest_offset, num_elements] = self.grad_position[param_id]
@@ -883,6 +893,9 @@ class FP16_DeepSpeedZeroOptimizer(object):
         param.grad = None
 
     def complete_grad_norm_calculation_for_cpu_offload(self, params):
+        """
+        btbt [cpu]使用事先在norm_for_param_grads中保存的计算好的norm计算集群全局norm ???问题是norm_for_param_grads也是在gpu中,这显示不出offload的优势阿?
+        """
         total_norm = 0.0
         norm_type = 2.0
         for p in params:
@@ -911,7 +924,7 @@ class FP16_DeepSpeedZeroOptimizer(object):
 
     ############################################################################################
 
-    def copy_grads_in_partition(self, param):
+    def copy_grads_in_partition(self, param):#输入本partition的param
         """
         btbt 要先判断param是否在本进程负责的partition内,若是则把它的grad复制到连续的grads_in_partition中,同时使param.grad连续化
 
@@ -1436,9 +1449,9 @@ class FP16_DeepSpeedZeroOptimizer(object):
             if type(self.optimizer) == DeepSpeedCPUAdam:
                 fp16_param_groups = [
                     fp16_partitions[partition_id]
-                    for fp16_partitions in self.parallel_partitioned_fp16_groups
+                    for fp16_partitions in self.parallel_partitioned_fp16_groups#btbt parallel_partitioned_fp16_groups在gpu
                 ]
-                self.optimizer.step(fp16_param_groups=fp16_param_groups)
+                self.optimizer.step(fp16_param_groups=fp16_param_groups)#btbt [cpu]在cpu_adam.cpp中把cpu的single_partition_of_fp32_groups更新后,再复制给parallel_partitioned_fp16_groups,然后通过下面parallel_partitioned_fp16_groups的for循环同步整个集群的param的最新值
             else:
                 self.optimizer.step()
                 for fp16_partitions, fp32_partition in zip(self.parallel_partitioned_fp16_groups, self.single_partition_of_fp32_groups):
