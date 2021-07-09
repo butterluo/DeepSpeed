@@ -181,9 +181,9 @@ class PrefetchCoordinator(object):
         # reuse distances
         self.reuse_numel_for_step_id = {}
 
-    def record_trace(self, sub_module):
+    def record_trace(self, sub_module):#btbt 把子模块的调用顺序记录下来,但只记录一次(第一次forward时),后续prefetch_next_sub_modules()去拉去数据时,是基于该记录去预先获取数据的
         if not self.trace_completed:
-            self.sub_module_trace.append(sub_module.id)
+            self.sub_module_trace.append(sub_module.id) #btbt 记录从forward开始到backward结束的子模块的调用顺序,其下标是调用顺序并与step_id对应
             self.id_to_sub_module_map[sub_module.id] = sub_module
 
     def print_trace(self):
@@ -431,8 +431,8 @@ class PartitionedParameterCoordinator(object):
                 )
         self.hierarchy += 1
 
-        # parameters are partitioned and need to be allgathered
-        self._all_gather(partitioned_params, async_op=True)
+        # parameters are partitioned and need to be allgathered #btbt ??? refactor 好像gather过来的数据放在param.data中,但param.ds_tensor又没清空?
+        self._all_gather(partitioned_params, async_op=True)#btbt _all_gather前sub_module.param中只有本分区的数据(在param.ds_tensor中),all_gather后就有了含其它分区的全部数据,而且这些数据以align后的大小(即为了能被world size整除,尾部可能有pad)在连续内存中存储
 
         # parameters are inflight and communication needs to be completed
         if partitioned_params or params_in_flight:
@@ -532,13 +532,19 @@ class PartitionedParameterCoordinator(object):
 
 
 class PreBackwardFunction(torch.autograd.Function):
+    """
+    #btbt 作用可能是: _apply_to_tensors_only()会把该Func节点挂在某子模块forward后的output tensor后,也就是计算图forward方向的最后
+    该func节点的forward只是保存pre_backward_function供backward用,并设置applied_pre_backward,以使得backward经过该submodule时,虽然该submodule的每个param都会调用该Func节点的backward,而pre_backward_function内仅对applied_pre_backward为false时执行操作,
+    一旦applied_pre_backward为true,pre_backward_function方法内就不会做操作, 也就是达到对于每个submodule做backward时pre_backward_function只调用一次,而不管该Func节点的backward被调了几次
+    而传入的pre_backward_function的作用时在backward前把param所有分区的数据all_gather过来,所以只在首次进入submodule.backward时调用也符合逻辑
+    """
     @staticmethod
     def forward(ctx, module, pre_backward_function, outputs):
         ctx.module = module
         ctx.pre_backward_function = pre_backward_function
         module.applied_pre_backward = False
         #print(f"After Forward: {ctx.module.__class__.__name__}")
-        outputs = outputs.detach()
+        outputs = outputs.detach()#btbt ??? 是由于该Func节点不涉及求导,才outputs.detach()去防止递归求导的发生?
         return outputs
 
     @staticmethod
@@ -549,10 +555,16 @@ class PreBackwardFunction(torch.autograd.Function):
 
 
 class PostBackwardFunction(torch.autograd.Function):
+    """
+    #btbt 作用可能是:_apply_to_tensors_only()会把该Func节点挂在某子模块forward前的input tensor后,也就是计算图forward方向的前面
+    该Func节点在forward时统计了该submodule中需要计算grad的tensor的个数(ds_grads_remaining)也就是该子模块需要做backward的次数,然后每经过一次该子模块的backwawrd会递减ds_grads_remaining
+    当ds_grads_remaining=0时也就是该子模块的所有backward都做完了,才调用传入的pre_backward_function(所以应该是post_backward_function)
+    该pre_backward_function其实是在该子模块所有backward做完后,调用release_sub_module对该子模块的param进行partition,使其只剩下本分区的数据
+    """
     @staticmethod
-    def forward(ctx, module, pre_backward_function, output):
+    def forward(ctx, module, pre_backward_function, output):#btbt 输入的output其实是forward的input, 而pre_backward_function其实是在该子模块所有backward做完后才执行
         ctx.module = module
-        if output.requires_grad:
+        if output.requires_grad:#btbt ??? output或input中涉及external param时能应对么
             #TODO SOME TIMES post backward does not seem to be triggered debug in detail
             #Should only cause increase in memory not correctness issue
             #if output.grad_fn.__class__.__name__ == 'ViewBackward':
@@ -646,23 +658,23 @@ class FP16_DeepSpeedZeroOptimizer_Stage3(object):
             group = None
             if mpu:
                 group = mpu.get_data_parallel_group()
-            Init(module=module, data_parallel_group=group, dtype=self.dtype)
+            Init(module=module, data_parallel_group=group, dtype=self.dtype)#btbt 调partition_parameters.py.Init()把model的所有param转成ds param,并对把param中属于该进程分区的数据保存在param.ds_tensor,原param.data用1占位
 
         for m in module.modules():
-            _init_external_params(m)
+            _init_external_params(m) #btbt external
 
         self.module = module
         self.elastic_checkpoint = elastic_checkpoint
-        self.overlap_comm = overlap_comm
+        self.overlap_comm = overlap_comm #btbt lap_com
 
         # Replace ._parameters with a new class to enable auto-registration of
         # external parameters
-        _inject_parameters(module, ZeROOrderedDict)
+        _inject_parameters(module, ZeROOrderedDict)#btbt ??? 把module中放param的dict替换成ZeROOrderedDict,为何这样做? 为处理external param? #btbt external
 
-        if self.overlap_comm:
+        if self.overlap_comm: #btbt lap_com
             self.gpu_sum = torch.zeros(1, dtype=torch.float).cuda()
 
-        ###################### offload optimizer setup ##################################
+        ###################### offload optimizer setup ################################## #btbt offload
         self.optimizer_swapper = None
         self.swap_optimizer = False
 
@@ -678,7 +690,7 @@ class FP16_DeepSpeedZeroOptimizer_Stage3(object):
             self.offload_optimizer_fast_init = offload_optimizer_config[
                 OFFLOAD_OPTIMIZER_FAST_INIT]
 
-        ###################### offload param setup ##################################
+        ###################### offload param setup ################################## #btbt offload
         self.offload_param = False
         self.offload_param_pin_memory = False
         self.params_in_nvme_and_cpu = False
@@ -704,8 +716,8 @@ class FP16_DeepSpeedZeroOptimizer_Stage3(object):
 
         see_memory_usage("Before Partitioned Parameter Coordinator", force=False)
 
-        fetch_stream = torch.cuda.Stream() if self.overlap_comm else None
-        self.param_coordinator = PartitionedParameterCoordinator(
+        fetch_stream = torch.cuda.Stream() if self.overlap_comm else None #btbt lap_com
+        self.param_coordinator = PartitionedParameterCoordinator(#btbt ??? PartitionedParameterCoordinator是干嘛用的?用于在不同分区间同步与分发数据
             comm_stream=fetch_stream,
             max_reuse_distance_in_numel=int(max_reuse_distance),
             max_available_parameters_in_numel=int(max_live_parameters))
@@ -714,14 +726,14 @@ class FP16_DeepSpeedZeroOptimizer_Stage3(object):
 
         #self.param_coordinator = PartitionedParameterCoordinator(comm_stream=torch.cuda.Stream())
         #-------------Stage 3 Setup-------------------#
-        # parameters smaller than the threshold will be collectively gathered at the
+        # parameters smaller than the threshold will be collectively gathered at the #btbt ??? 注释没看懂
         # end of the optimizer step and will be kept till the end of the backward pass
         # TODO maybe worth just replicating these parameters and doing all reduce for them
         self.persistence_threshold = int(param_persistence_threshold)
 
-        self.persistent_parameters = self.persistent_parameters()
+        self.persistent_parameters = self.persistent_parameters() #btbt ??? 把所有分区前的数据个数小于stage3_param_persistence_threshold的param都保存到self.persistent_parameters, 但具体怎么用
 
-        self.setup_zero_stage3_hooks()
+        self.setup_zero_stage3_hooks() #btbt 在forward前后加入了很多hook,用于在做forward,backward时获取其它分区的数据,以及计算完后把不属于本分区的数据推送给其它分区, 这些操作基本时调用param_coordinator完成的
 
         #resetting ds_tensor just in case parameters have been changed after initialization
         #example .half() or .to()
@@ -759,7 +771,7 @@ class FP16_DeepSpeedZeroOptimizer_Stage3(object):
         # Holds the mode parameter
         # The param.data may not hold any meaningful data
         # when param's status is NOT_AVAILABLE or IN_FLGHT
-        self.fp16_groups = []
+        self.fp16_groups = []#btbt 把原param group按照sub_group_size划分成多个sub grp后放入此 ,元素是按(所有param grp的)sub grp划分sub lst的param,其下标为sub grp id
 
         # Hold partitioned parameters
         self.fp16_partitioned_groups = []
@@ -787,31 +799,31 @@ class FP16_DeepSpeedZeroOptimizer_Stage3(object):
         self.prefetch_elements = int(prefetch_bucket_size)
 
         # padding on each partition for alignment purposes
-        self.groups_padding = []
+        self.groups_padding = []#btbt 保存fp16_groups中的sub grp的param的pad size,一般只有最后rank所负责的partition param要pad,其它的pad size为0
 
         self.sub_group_size = sub_group_size
 
-        self.sub_group_to_group_id = {}
-        see_memory_usage("Before creating fp16 partitions", force=True)
-        self._create_fp16_partitions_with_defragmentation()
+        self.sub_group_to_group_id = {}#btbt 下标是fp16_groups定义的sub grp id,对应的值是param grp下标定义的param grp id
+        see_memory_usage("Before creating fp16 partitions", force=True)#btbt ??? 如果用全精度计算的话,是不是可以去掉fp16相关的东西? 虽然混合精度会快些,但效果也会下降些
+        self._create_fp16_partitions_with_defragmentation()#btbt 把param grp分成sub grp,然后把当前rank负责的ds_tensor保存到sub grp 大小划分的连续内存中,并把param.data指向连续内存中的ds_tensor,使得任何对param.data的操作都是对该连续内存的操作
         num_fp16_subgroups = len(self.fp16_partitioned_groups_flat)
         see_memory_usage(f"After creating fp16 partitions: {num_fp16_subgroups}",
                          force=False)
 
         # Optimizer ensor swapping
-        if self.swap_optimizer:
+        if self.swap_optimizer:#btbt offload
             self._configure_tensor_swapping(offload_optimizer_config, aio_config)
 
         see_memory_usage("Before creating fp32 partitions", force=False)
-        self._create_fp32_partitions()
-        see_memory_usage("After creating fp32 partitions", force=False)
+        self._create_fp32_partitions()#btbt ??? 就是把fp16_partitioned_groups_flat的东西复制一份fp32的到fp32_partitiioned_groups_flat中,但offload那部分优点复杂,需要进一步看?
+        see_memory_usage("After creating fp32 partitions", force=False)#btbt _create_fp32_partitions()中把optimizer.param_group清空了
         dist.barrier()
 
         # To support pipelined optimizer swapping
-        self._create_next_swappable_fp32_groups()
+        self._create_next_swappable_fp32_groups()#btbt offload
 
         see_memory_usage("Before initializing optimizer states", force=False)
-        self.initialize_optimizer_states()
+        self.initialize_optimizer_states()#btbt 用连续内存中的partition param.ds_tensor初始化optimizer中相应的各种状态
         see_memory_usage("After initializing optimizer states", force=False)
         dist.barrier()
 
@@ -843,10 +855,10 @@ class FP16_DeepSpeedZeroOptimizer_Stage3(object):
         self.previous_reduced_grads = None
 
         # simplified param id
-        self.param_id = {}
+        self.param_id = {}#btbt ??? 这是不是和在partition_parameters.py初始化的param.ds_id的作用重复了?还是有其它作用?
 
         count = 0
-        for i, params_group in enumerate(self.fp16_groups):
+        for i, params_group in enumerate(self.fp16_groups):#btbt 产生全局唯一的param的unique_id,并在self.param_id中保存uuid与本rank的序列id的对应关系,param_dict保存了param序列id与param
             for param in params_group:
                 unique_id = id(param)
                 self.param_id[unique_id] = count
@@ -863,7 +875,7 @@ class FP16_DeepSpeedZeroOptimizer_Stage3(object):
         see_memory_usage(f"Before Set Grad positions", force=False)
 
         self.grad_position = {}
-        self.set_grad_positions()
+        self.set_grad_positions()#btbt 初始化grad_position的key为param本rank的序列id,val是(sub grp序列id, param数据在sub grp flat(16/32)中的offset, param数据的size)
         see_memory_usage(f"Before CPU Offload initialization", force=False)
 
         self.grads_in_partition = None
@@ -891,7 +903,7 @@ class FP16_DeepSpeedZeroOptimizer_Stage3(object):
         self.averaged_gradients = {}
 
         #creates backward hooks for gradient partitioning
-        self.create_reduce_and_remove_grad_hooks()
+        self.create_reduce_and_remove_grad_hooks()#btbt 这里做的和stage 2相似,就是在tensor.grad中注册了hook用于对grad进行分区处理
 
         #exit(0)
 
@@ -1096,11 +1108,11 @@ class FP16_DeepSpeedZeroOptimizer_Stage3(object):
 
                 #These are the list of the partitoned parameters
                 self.fp16_partitioned_groups.append(
-                    [param.ds_tensor for param in self.fp16_groups[i]])
+                    [param.ds_tensor for param in self.fp16_groups[i]])#btbt param.ds_tensor在__init__中调用partition_param.py的Init()时,通过把param转成ds版的,然后用param.partition()将分区数据保存在ds_tensor中
 
                 total_elements = sum(
                     [t.ds_numel for t in self.fp16_partitioned_groups[i]])
-                self.fp16_partitioned_groups_flat_numel.append(total_elements)
+                self.fp16_partitioned_groups_flat_numel.append(total_elements)#btbt param.ds_tensor中的数据时以及flatten的,间partition_param.py的_partition_param()
 
                 print_rank_0(
                     f"fp16 group {i} partitioned_param norms : {[param.ds_tensor.norm().item() for param in self.fp16_groups[i]]}"
@@ -1122,10 +1134,10 @@ class FP16_DeepSpeedZeroOptimizer_Stage3(object):
                     see_memory_usage(f"Before moving param subgroup group {i} to CPU",
                                      force=False)
                     #move all the parameters to cpu to free up GPU space for creating flat buffer
-                    move_to_cpu(self.fp16_partitioned_groups[i])
+                    move_to_cpu(self.fp16_partitioned_groups[i])#btbt ??? fp16_partitioned_groups中的partition param 移到cpu后就不管了?岂不是和fp16_paritioned_groups_flat一起存了两份?前者在cpu,后者在gpu?
                     see_memory_usage(f"After moving param subgroup {i} to CPU",
                                      force=False)
-
+                    #btbt ??? 通过self.flatten的cpp操作开辟gpu连续内存,并把刚移到cpu的数据再移到该gpu连续内存,用param.contigouous()得到的数据时按param保存在连续显存中的,而这里时按sub grp保存在连续显存中,就是说这个连续显存大小时sub grp的大小
                     #create flat buffer in CPU and move to GPU
                     self.fp16_partitioned_groups_flat.append(
                         self.flatten_dense_tensors_aligned(
@@ -1163,7 +1175,7 @@ class FP16_DeepSpeedZeroOptimizer_Stage3(object):
                 # move param to flat buffer for both param offload on/off
                 self._move_to_flat_buffer(self.fp16_groups[i],
                                           self.fp16_partitioned_groups_flat[i],
-                                          avoid_copy=not self.offload_param)
+                                          avoid_copy=not self.offload_param)#btbt 非offload时(gpu)是avoid copy的,此时仅把fp16_groups中的sub grp的param.data指向fp16_partitioned_groups_flat连续内存中保存的ds_tensor值,即对param.data的数据操作实际上是发生在连续内存的param.ds_tensor数据上的
 
                 see_memory_usage(f"After Flattening param group {i}", force=False)
 
@@ -1332,7 +1344,7 @@ class FP16_DeepSpeedZeroOptimizer_Stage3(object):
             param_group['params'] = []
 
     def _create_fp16_sub_groups(self, params_group):
-
+        #btbt 按用户定的sub grp sz把param group划分成多个sub grp
         params_group_numel = sum([param.partitioned_size() for param in params_group])
         sub_group_size = self.sub_group_size
 
@@ -1365,15 +1377,15 @@ class FP16_DeepSpeedZeroOptimizer_Stage3(object):
 
     def setup_zero_stage3_hooks(self):
         self.hierarchy = 0
-        self._register_hooks_recursively(self.module)
+        self._register_hooks_recursively(self.module) #btbt 先从叶端的子模块开始添加hook,因此hook的执行
 
         #reset step at the beginning of forward
-        def _pre_forward_hook(module, *args):
+        def _pre_forward_hook(module, *args):#btbt 在整个模型开始做forward前先reset_step把step_id置零
             self.param_coordinator.reset_step()
 
         #reset step if in inference mode
         def _end_of_forward_hook(module, *args):
-
+            # btbt 在整个模型完成forward后,如果是training则不把step_id置零,因为record_trace()其实是要记录从forward开始到backward结束的每一个step; 但如果是test或eval则要reset_step把step_id置零
             if not torch._C.is_grad_enabled():
                 self.param_coordinator.reset_step()
 
@@ -1382,14 +1394,14 @@ class FP16_DeepSpeedZeroOptimizer_Stage3(object):
         self.module.register_forward_pre_hook(_pre_forward_hook)
 
         # Add top todule to stack trace
-        global FWD_MODULE_STACK
+        global FWD_MODULE_STACK #btbt ??? 有啥用?对应的有用于backward的么?
         FWD_MODULE_STACK.append(self.module)
 
     def persistent_parameters(self):
         persistent_params = []
         total_persistent_parameters = 0
         for _, param in self.module.named_parameters(recurse=True):
-            if param.ds_numel < self.persistence_threshold:
+            if param.ds_numel < self.persistence_threshold: #btbt ds_numel保存的是param分区前的数据个数
                 param.ds_persist = True
                 persistent_params.append(param)
                 total_persistent_parameters += param.ds_numel
@@ -1407,12 +1419,12 @@ class FP16_DeepSpeedZeroOptimizer_Stage3(object):
 
         for child in module.children():
             count[0] = count[0] + 1
-            self._register_hooks_recursively(child, count=count)
+            self._register_hooks_recursively(child, count=count) #btbt 最叶子端的子模块开始添加hook, 因此最叶子端的子模块的hook会先执行(当运行到该子模块时)
 
-        def _pre_forward_module_hook(module, *args):
+        def _pre_forward_module_hook(module, *args): #btbt register_forward_pre_hook,每次进入子模块forward前执行
             self.pre_sub_module_forward_function(module)
 
-        def _post_forward_module_hook(module, input, output):
+        def _post_forward_module_hook(module, input, output):#btbt register_forward_hook,每次完成子模块forward后执行
             global FWD_MODULE_STACK
             FWD_MODULE_STACK.pop()
 
@@ -1428,7 +1440,7 @@ class FP16_DeepSpeedZeroOptimizer_Stage3(object):
                     output = outputs
                     #print(f'convert output to {output}')
 
-            for item in filter(lambda item: is_zero_param(item), output):
+            for item in filter(lambda item: is_zero_param(item), output):#btbt external ??? 如何处理output时依赖external param的情况? 要先把计算依赖的external param先all_gather过来?
                 if not any(id(item) in m._external_params for m in FWD_MODULE_STACK):
                     item.ds_active_sub_modules += 1
                     module_to_register = FWD_MODULE_STACK[-1]
@@ -1447,12 +1459,12 @@ class FP16_DeepSpeedZeroOptimizer_Stage3(object):
 
                     item.all_gather()
 
-            self.post_sub_module_forward_function(module)
+            self.post_sub_module_forward_function(module)#btbt ??? 调用release_sub_module(),但这不是在_post_backward_module_hook中会通过PostBackwrdFunction在backward时又调一次么
 
-        def _pre_backward_module_hook(module, inputs, output):
+        def _pre_backward_module_hook(module, inputs, output):#btbt register_forward_hook,每次完成子模块forward后执行
             def _run_before_backward_function(sub_module):
                 if sub_module.applied_pre_backward is False:
-                    self.pre_sub_module_backward_function(sub_module)
+                    self.pre_sub_module_backward_function(sub_module)#btbt 其实就是fetch sub module
                     sub_module.applied_pre_backward = True
 
             return _apply_to_tensors_only(module,
@@ -1483,12 +1495,12 @@ class FP16_DeepSpeedZeroOptimizer_Stage3(object):
                 _run_after_backward_hook,
                 inputs)
 
-        def _post_backward_module_hook(module, inputs):
+        def _post_backward_module_hook(module, inputs):#btbt register_forward_pre_hook,每次进入子模块forward前执行
             module.ds_grads_remaining = 0
 
             def _run_after_backward_function(sub_module):
                 if sub_module.ds_grads_remaining == 0:
-                    self.post_sub_module_backward_function(sub_module)
+                    self.post_sub_module_backward_function(sub_module) #btbt 其实就是release sub modeule
 
             return _apply_to_tensors_only(module,
                                           PostBackwardFunction,
@@ -1504,23 +1516,23 @@ class FP16_DeepSpeedZeroOptimizer_Stage3(object):
         module.register_forward_hook(_pre_backward_module_hook)
 
         # post backward hook
-        module.register_forward_pre_hook(_post_backward_module_hook)
+        module.register_forward_pre_hook(_post_backward_module_hook)#btbt ??? 其实是通过_apply_to_tensors_only去在计算图中增加PostBackwardFunction节点,然后该节点再调post_sub_module_backward_function,但岂不是每次forward时都增加一次PostBackwardFunction节点?
 
-    def pre_sub_module_forward_function(self, sub_module):
+    def pre_sub_module_forward_function(self, sub_module):#btbt register_forward_pre_hook,每次进入子模块forward前执行
         see_memory_usage(f"Before sub module function {sub_module.__class__.__name__}",
                          force=False)
 
         global FWD_MODULE_STACK
         FWD_MODULE_STACK.append(sub_module)
 
-        self.param_coordinator.record_trace(sub_module)
+        self.param_coordinator.record_trace(sub_module)#btbt 把子模块的调用顺序记录下来,但只记录一次(第一次forward时),后续prefetch_next_sub_modules()去拉去数据时,是基于该记录去预先获取数据的
 
-        self.param_coordinator.fetch_sub_module(sub_module)
+        self.param_coordinator.fetch_sub_module(sub_module)#btbt 获取当前子模块除本分区以外各分区的数据,供该子模块forward计算用
         see_memory_usage(
             f"Before sub module function {sub_module.__class__.__name__} after fetch",
             force=False)
 
-        self.param_coordinator.prefetch_next_sub_modules(
+        self.param_coordinator.prefetch_next_sub_modules(#btbt 基于record_trace()时记录的子模块调用顺序,预先获取下一个要计算要用到的子模块的本分区外数据
             sub_module,
             numel=self.prefetch_elements,
             nvme=self.params_in_nvme_and_cpu)
@@ -1528,30 +1540,30 @@ class FP16_DeepSpeedZeroOptimizer_Stage3(object):
             f"Before sub module function {sub_module.__class__.__name__} after prefetch",
             force=False)
 
-        self.param_coordinator.increment_step(sub_module)
+        self.param_coordinator.increment_step(sub_module)#btbt 递增PrefetchCoordinator.step_id,使record_trace的子模块与每一步的step_id对应上
 
-    def post_sub_module_forward_function(self, sub_module):
+    def post_sub_module_forward_function(self, sub_module):#btbt register_forward_hook,每次完成子模块forward后执行
         see_memory_usage(
             f"After sub module function {sub_module.__class__.__name__} {sub_module.id} before release",
             force=False)
 
-        self.param_coordinator.release_sub_module(sub_module)
+        self.param_coordinator.release_sub_module(sub_module)#btbt 对计算完的本子模块的param进行分区,也就是非本分区的数据会被移除
 
         see_memory_usage(
             f"After sub module function {sub_module.__class__.__name__}  {sub_module.id} after release",
             force=False)
 
-    def pre_sub_module_backward_function(self, sub_module):
-        self.param_coordinator.record_trace(sub_module)
+    def pre_sub_module_backward_function(self, sub_module):#btbt 通过PreBackwardFunction在该子模块开始backward前执行, 参考pre_sub_module_forward_function
+        self.param_coordinator.record_trace(sub_module) #btbt ??? 这个和forward时的pre_sub_module_forward_function()->record_trace()会有冲突么
 
         self.param_coordinator.fetch_sub_module(sub_module)
 
         self.param_coordinator.prefetch_next_sub_modules(sub_module,
-                                                         numel=self.prefetch_elements)
+                                                         numel=self.prefetch_elements) #btbt next sub module的计算与record_trace和step_id相关
 
         self.param_coordinator.increment_step(sub_module)
 
-    def post_sub_module_backward_function(self, sub_module):
+    def post_sub_module_backward_function(self, sub_module):#btbt 通过PostBackwardFunction在该子模块所有backward做完后执行,参考post_sub_module_forward_function
         see_memory_usage(
             f"After sub module backward function {sub_module.__class__.__name__} {sub_module.id} before release",
             force=False)
@@ -1572,13 +1584,13 @@ class FP16_DeepSpeedZeroOptimizer_Stage3(object):
         param_group_id = self.sub_group_to_group_id[sub_group_id]
         fp32_param = self.fp32_partitioned_groups_flat[sub_group_id]
         fp16_param = self.fp16_partitioned_groups_flat[sub_group_id]
-        self.optimizer.param_groups[param_group_id]['params'] = [fp32_param]
+        self.optimizer.param_groups[param_group_id]['params'] = [fp32_param]#btbt 先把连续内存的fp32数据装入optimizer,跑了ste()后再清空
 
         self.optimizer.step()
         self.optimizer.param_groups[param_group_id]['params'] = []
 
         if fp16_param is not None:
-            fp16_param.data.copy_(fp32_param.data)
+            fp16_param.data.copy_(fp32_param.data)#btbt ??? 为啥fp16_partitioned_groups_flat又保存fp32的数据了?
         else:
             #synchronize incase there is a previous write going on the reuse buffer
             self.fp16_groups[sub_group_id][0].nvme_swapper.synchronize_writes()
@@ -1624,7 +1636,7 @@ class FP16_DeepSpeedZeroOptimizer_Stage3(object):
         num_subgroups = len(self.fp16_groups)
 
         largest_numel = max(
-            [sum([p.ds_numel for p in psg]) for psg in self.fp16_partitioned_groups])
+            [sum([p.ds_numel for p in psg]) for psg in self.fp16_partitioned_groups])#btbt ??? fp16_partitioned_groups不是在cpu保存了sub grp params.ds_tensor么?ds_tensor的ds_numel应该是parition size的阿?
         gradient_dtype = self.fp32_partitioned_groups_flat[0].dtype
         gradient_buffer = torch.zeros(int(largest_numel),
                                       dtype=gradient_dtype,
@@ -1664,7 +1676,7 @@ class FP16_DeepSpeedZeroOptimizer_Stage3(object):
                 self.fp32_partitioned_groups_flat[i].grad = gradient_buffer.narrow(
                     0,
                     0,
-                    num_elements)
+                    num_elements)#btbt 就是把fp32_partitioned_groups_flat.grad初始化为0,跑下optimizer.step()以初始化optimizer的各种状态
 
             self._optimizer_step(i)
 
@@ -1959,7 +1971,7 @@ class FP16_DeepSpeedZeroOptimizer_Stage3(object):
             # parameters are partitionied. The method is impelemnted by the
             # DeepSpeed param extensions to the pytroch parameter, so its up to
             # the extension to define what happens here
-            params_to_reduce[0].reduce_gradients_at_owner(
+            params_to_reduce[0].reduce_gradients_at_owner(#btbt ??? 这里没用到ipg_buffer(即输入参数tensor)不会有问题吧?
                 param_list=params_to_reduce,
                 hierarchy=self.param_coordinator.hierarchy)
 
@@ -2679,7 +2691,7 @@ class FP16_DeepSpeedZeroOptimizer_Stage3(object):
         self.fp32_partitioned_groups_flat[sub_group_id].grad = None
 
     def _unflatten_partitioned_parameters(self, sub_group_id):
-        updated_params = self.unflatten(self.fp16_partitioned_groups_flat[sub_group_id],
+        updated_params = self.unflatten(self.fp16_partitioned_groups_flat[sub_group_id],#btbt ???
                                         self.fp16_partitioned_groups[sub_group_id])
 
         for partitioned_param, q in zip(self.fp16_partitioned_groups[sub_group_id], updated_params):
@@ -2722,7 +2734,7 @@ class FP16_DeepSpeedZeroOptimizer_Stage3(object):
             self.reset_cpu_buffers()
 
         #Gathering persisting parameters
-        if len(self.persistent_parameters) > 0:
+        if len(self.persistent_parameters) > 0:#btbt ??? persistent_parameter的作用和使用?
             self.persistent_parameters[0].all_gather(self.persistent_parameters)
 
         if self.swap_optimizer:

@@ -423,10 +423,10 @@ class Init(InsertPostInitMethodToModuleSubClasses):
         #It can be same as local_device or it could be CPU or NVMe.
         self.remote_device = self.local_device if remote_device is None else remote_device
         self.pin_memory = pin_memory if (
-            self.remote_device == OFFLOAD_CPU_DEVICE) else False
+            self.remote_device == OFFLOAD_CPU_DEVICE) else False #btbt offload
 
         # Enable fp16 param swapping to NVMe
-        if self.remote_device == OFFLOAD_NVME_DEVICE:
+        if self.remote_device == OFFLOAD_NVME_DEVICE:  #btbt offload
             _ds_config = DeepSpeedConfig(config)
             self.param_swapper = AsyncPartitionedParameterSwapper(_ds_config)
         else:
@@ -484,7 +484,7 @@ class Init(InsertPostInitMethodToModuleSubClasses):
         param.ds_param_type = ZeroParamType.PARTITIONED
 
         # Replicated vs Partitioned vs Inflight
-        param.ds_status = ZeroParamStatus.AVAILABLE
+        param.ds_status = ZeroParamStatus.AVAILABLE #btbt ??? 指param.data中的值是否available? 因为partition()后仅保留本区的对应值,param.data仅以1占位,其它区的值就 not_available了
 
         # Stores the shape of the original tensor
         param.ds_shape = param.shape
@@ -638,7 +638,7 @@ class Init(InsertPostInitMethodToModuleSubClasses):
             #print_rank_0(f"After Partitioning Param {param.ds_id}")
             # self._param_status(param)
 
-    def _partition_param(self, param, buffer=None, has_been_updated=False):
+    def _partition_param(self, param, buffer=None, has_been_updated=False): #btbt 分区后只在param.ds_tensor中保留param中属于本区的数据,param.data中以1占位
         assert param.ds_status is not ZeroParamStatus.INFLIGHT, f" {param} Cannot parititon a param in flight"
 
         global reuse_buffers
@@ -678,12 +678,12 @@ class Init(InsertPostInitMethodToModuleSubClasses):
 
                 return
 
-            tensor_size = self._aligned_size(param)
+            tensor_size = self._aligned_size(param)#btbt 取一个可整除world size的param tensor size, 因此每个进程对partition的划分都是一致的
             partition_size = tensor_size // self.world_size
 
             if param.ds_tensor is None:
                 final_location = None
-                if self.remote_device == OFFLOAD_NVME_DEVICE and self.param_swapper.swappable_tensor(
+                if self.remote_device == OFFLOAD_NVME_DEVICE and self.param_swapper.swappable_tensor(#btbt offload
                         numel=partition_size):
                     final_location = OFFLOAD_NVME_DEVICE
                     buffer = self.param_swapper.get_buffer(param, partition_size)
@@ -702,7 +702,7 @@ class Init(InsertPostInitMethodToModuleSubClasses):
                         device=OFFLOAD_CPU_DEVICE
                         if self.remote_device == OFFLOAD_NVME_DEVICE else
                         self.remote_device)
-                    if self.pin_memory:
+                    if self.pin_memory:#btbt offload
                         partitioned_tensor = partitioned_tensor.pin_memory()
 
                 partitioned_tensor.requires_grad = False
@@ -711,12 +711,12 @@ class Init(InsertPostInitMethodToModuleSubClasses):
                 param.ds_tensor.status = PartitionedParamStatus.AVAILABLE
                 param.ds_tensor.final_location = final_location
 
-            start = partition_size * self.rank
+            start = partition_size * self.rank#btbt 计算该进程在该param内所负责的partition的范围
             end = start + partition_size
 
-            one_dim_param = param.contiguous().view(-1)
-
-            if start < param.ds_numel and end <= param.ds_numel:
+            one_dim_param = param.contiguous().view(-1)#btbt 用连续内存保存数据
+            #btbt 把在param中属于该分区的数据拷贝到ds版param.ds_tensor中
+            if start < param.ds_numel and end <= param.ds_numel:#btbt 若该分区就在param的size的范围内
                 src_tensor = one_dim_param.narrow(0, start, partition_size)
 
                 param.ds_tensor.copy_(src_tensor)
@@ -727,7 +727,7 @@ class Init(InsertPostInitMethodToModuleSubClasses):
                 #                                  dtype=param.dtype,
                 #                                  device=self.remote_device )
 
-                if start < param.ds_numel:
+                if start < param.ds_numel:#btbt 如果该分区跨了两个param
                     elements_to_copy = param.ds_numel - start
                     param.ds_tensor.narrow(0,
                                            0,
@@ -735,7 +735,7 @@ class Init(InsertPostInitMethodToModuleSubClasses):
                                                one_dim_param.narrow(
                                                    0,
                                                    start,
-                                                   elements_to_copy))
+                                                   elements_to_copy))#btbt 为了整除world size, padding为0
 
             #print(f"Remote device {self.remote_device}")
 
@@ -747,11 +747,11 @@ class Init(InsertPostInitMethodToModuleSubClasses):
 
             see_memory_usage(f'Before partitioning param {param.ds_id} {param.shape}',
                              force=False)
-            param.data = torch.ones(1, dtype=self.dtype).to(param.device)
+            param.data = torch.ones(1, dtype=self.dtype).to(param.device)#btbt 原param.data用1占位,实际分区内的数据放在了param.ds_tensor中
             see_memory_usage(f'After partitioning param {param.ds_id} {param.shape}',
                              force=False)
 
-            if param.ds_tensor.final_location == OFFLOAD_NVME_DEVICE:
+            if param.ds_tensor.final_location == OFFLOAD_NVME_DEVICE:#btbt offload
                 self.param_swapper.swap_out_and_release([param])
                 print_rank_0(
                     f"ID {param.ds_id} Offloaded to nvme offload and buffers released.")
@@ -913,10 +913,10 @@ class Init(InsertPostInitMethodToModuleSubClasses):
                                            elements).copy_(
                                                reduced_partition.narrow(0,
                                                                         0,
-                                                                        elements))
+                                                                        elements))#btbt ??? 非本区的param数据的grad怎么处理
 
     def _reduce_scatter_gradient(self, param):
-
+        #btbt ??? 得到的时param中本区的数据的grad?
         partition_size = param.ds_tensor.ds_numel
         #output = torch.empty(partition_size, dtype=param.dtype, device=param.device)
 

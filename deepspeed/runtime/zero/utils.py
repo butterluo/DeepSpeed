@@ -5,7 +5,7 @@ from deepspeed.ops.adam import DeepSpeedCPUAdam
 from deepspeed.ops.adam import FusedAdam
 
 
-def _initialize_parameter_parallel_groups(parameter_parallel_size=None):
+def _initialize_parameter_parallel_groups(parameter_parallel_size=None):#btbt ???
     data_parallel_size = int(dist.get_world_size())
     parameter_parallel_size = parameter_parallel_size or data_parallel_size
     logger.info("data_parallel_size: %s, parameter_parallel_size: %s",
