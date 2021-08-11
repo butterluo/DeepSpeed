@@ -267,7 +267,7 @@ class FP16_DeepSpeedZeroOptimizer(object):
             self.single_partition_of_fp32_groups[
                 i].requires_grad = True  # keep this in case internal optimizer uses it
             param_group['params'] = [self.single_partition_of_fp32_groups[i]]#btbt param_group['params']是供原生optimizer进行grad计算与update用的param,这里的意思是该进程的原生optimizer只负责基于所负责的partition的param进行计算grad并仅update所负责的partition param
-
+            #btbt param_group['params']此时并不指向model的param,model的param已经在上面被flat和连续并转移到self.fp16_groups中了,所以model.forward用的是self.fp16_groups中的param
             partition_size = len(self.fp16_groups_flat[i]) / dist.get_world_size(
                 group=self.dp_process_group)
             params_in_partition, params_not_in_partition, first_offset = self.get_partition_info(self.fp16_groups[i], partition_size, partition_id)
@@ -591,7 +591,7 @@ class FP16_DeepSpeedZeroOptimizer(object):
 
                     def wrapper(param, i):
                         param_tmp = param.expand_as(param)
-                        grad_acc = param_tmp.grad_fn.next_functions[0][0]
+                        grad_acc = param_tmp.grad_fn.next_functions[0][0] #btbt 获取param的backward func也就是grad_fn, ???但为何要先做expand_as?
                         #btbt 当某param的grad计算完后会调用该hook,
                         def reduce_partition_and_remove_grads(*notneeded):
                             self.reduce_ready_partitions_and_remove_grads(param, i)#btbt 这里其实直接调reduce_independent_p_g_buckets_and_remove_grads
