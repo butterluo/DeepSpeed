@@ -654,14 +654,14 @@ class FP16_DeepSpeedZeroOptimizer_Stage3(object):
         self.unflatten = util_ops.unflatten
         self.dtype = self.optimizer.param_groups[0]['params'][0].dtype
 
-        if not all(is_zero_param(p) for p in module.parameters()):
+        if not all(is_zero_param(p) for p in module.parameters()):#btbt ??? module.parameters 和 optimizer.param_groups[0]['params'] 在ds化前是否指向同一批param? ds化后呢?
             group = None
             if mpu:
                 group = mpu.get_data_parallel_group()
             Init(module=module, data_parallel_group=group, dtype=self.dtype)#btbt 调partition_parameters.py.Init()把model的所有param转成ds param,并对把param中属于该进程分区的数据保存在param.ds_tensor,原param.data用1占位
 
         for m in module.modules():
-            _init_external_params(m) #btbt external
+            _init_external_params(m) #btbt 加了些处理external param的方法到sub modules上
 
         self.module = module
         self.elastic_checkpoint = elastic_checkpoint
@@ -716,7 +716,7 @@ class FP16_DeepSpeedZeroOptimizer_Stage3(object):
 
         see_memory_usage("Before Partitioned Parameter Coordinator", force=False)
 
-        fetch_stream = torch.cuda.Stream() if self.overlap_comm else None #btbt lap_com
+        fetch_stream = torch.cuda.Stream() if self.overlap_comm else None #btbt lap_com ??? 通过不同的stream overlap通信?不同stream间的数据同步也耗时阿
         self.param_coordinator = PartitionedParameterCoordinator(#btbt ??? PartitionedParameterCoordinator是干嘛用的?用于在不同分区间同步与分发数据
             comm_stream=fetch_stream,
             max_reuse_distance_in_numel=int(max_reuse_distance),
@@ -1139,7 +1139,7 @@ class FP16_DeepSpeedZeroOptimizer_Stage3(object):
                                      force=False)
                     #btbt ??? 通过self.flatten的cpp操作开辟gpu连续内存,并把刚移到cpu的数据再移到该gpu连续内存,用param.contigouous()得到的数据时按param保存在连续显存中的,而这里时按sub grp保存在连续显存中,就是说这个连续显存大小时sub grp的大小
                     #create flat buffer in CPU and move to GPU
-                    self.fp16_partitioned_groups_flat.append(
+                    self.fp16_partitioned_groups_flat.append(#btbt 此处把fp16_partitioned_groups中保存的各个param的ds_tensor(挪到cpu后)凑在一起成为连续内存块,然后再移到GPU,并保存在fp16_partitioned_groups_flat中,此时它里面应该只有一个tensor(对应一个pram group),但这个tensor的连续内存中含有所有pram的ds_tensor的数据,也就是有该partition所负责的所有pram的分区数据
                         self.flatten_dense_tensors_aligned(
                             self.fp16_partitioned_groups[i],
                             1).cuda(torch.cuda.current_device()))

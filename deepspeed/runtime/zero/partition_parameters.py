@@ -727,7 +727,7 @@ class Init(InsertPostInitMethodToModuleSubClasses):
                 #                                  dtype=param.dtype,
                 #                                  device=self.remote_device )
 
-                if start < param.ds_numel:#btbt 如果该分区跨了两个param
+                if start < param.ds_numel:#btbt 如果该分区跨了在原param末尾而元素又不够partition_size个,则pad为0
                     elements_to_copy = param.ds_numel - start
                     param.ds_tensor.narrow(0,
                                            0,
